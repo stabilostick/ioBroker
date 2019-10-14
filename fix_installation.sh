@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Increase this version number whenever you update the fixer
-FIXER_VERSION="2019-07-21" # format YYYY-MM-DD
+FIXER_VERSION="2019-10-13" # format YYYY-MM-DD
 
 # Test if this script is being run as root or not
 if [[ $EUID -eq 0 ]]; then
@@ -10,8 +10,10 @@ else
 	IS_ROOT=false
 fi
 ROOT_GROUP="root"
+
 # Test which platform this script is being run on
 unamestr=$(uname)
+# When adding another supported platform, also add detection for the install command
 if [ "$unamestr" = "Linux" ]; then
 	HOST_PLATFORM="linux"
 elif [ "$unamestr" = "Darwin" ]; then
@@ -25,6 +27,50 @@ else
 	echo "Unsupported platform!"
 	exit 1
 fi
+
+# Detect install command
+case "$HOST_PLATFORM" in
+	"linux")
+		if [[ $(which "yum" 2>/dev/null) == *"/yum" ]]; then
+			INSTALL_CMD="yum"
+		else
+			INSTALL_CMD="apt-get"
+		fi
+	;;
+	"osx")
+		INSTALL_CMD="brew"
+	;;
+	"freebsd")
+		INSTALL_CMD="pkg"
+	;;
+	# The following should never happen, but better be safe than sorry
+	*)
+		echo "Unsupported platform $HOST_PLATFORM"
+	;;
+esac
+
+# Check if "sudo" command is available (in case we're not root)
+# If we're root, sudo is going to be installed later
+if [ "$IS_ROOT" != true ]; then
+	if [[ $(which "sudo" 2>/dev/null) != *"/sudo" ]]; then
+		echo "${red}Cannot continue because the \"sudo\" command is not available!${normal}"
+		echo "Please install it first using \"$INSTALL_CMD install sudo\""
+		exit 1
+	fi
+fi
+
+# Adds dirs to the PATH variable without duplicating entries
+add_to_path() {
+	case ":$PATH:" in
+		*":$1:"*) :;; # already there
+		*) PATH="$1:$PATH";;
+	esac
+}
+# Starting with Debian 10 (Buster), we need to add the [/usr[/local]]/sbin
+# directories to PATH for non-root users
+if [ -d "/sbin" ]; then add_to_path "/sbin"; fi
+if [ -d "/usr/sbin" ]; then add_to_path "/usr/sbin"; fi
+if [ -d "/usr/local/sbin" ]; then add_to_path "/usr/local/sbin"; fi
 
 # Directory where iobroker should be installed
 IOB_DIR="/opt/iobroker"
@@ -65,9 +111,88 @@ fi
 # Where the fixer script is located
 FIXER_URL="https://iobroker.net/fix.sh"
 
+# Remember the full path of bash
+BASH_CMDLINE=$(which bash)
+
 # Test if we're running inside a docker container
 running_in_docker() {
 	awk -F/ '$2 == "docker"' /proc/self/cgroup | read
+}
+
+# Changes the user's npm command so it is always executed as `iobroker`
+# when inside the iobroker directory
+change_npm_command_user() {
+	NPM_COMMAND_FIX_PATH=~/.iobroker/npm_command_fix
+	NPM_COMMAND_FIX=$(cat <<- EOF
+		# While inside the iobroker directory, execute npm as iobroker
+		function npm() {
+			__real_npm=\$(which npm)
+			if [[ $(pwd) == "$IOB_DIR"* ]]; then
+				sudo -H -u $IOB_USER \$__real_npm \$*
+			else
+				eval \$__real_npm \$*
+			fi
+		}
+		EOF
+	)
+	BASHRC_LINES=$(cat <<- EOF
+
+		# Forces npm to run as $IOB_USER when inside the iobroker installation dir
+		source ~/.iobroker/npm_command_fix
+		EOF
+	)
+
+	mkdir -p ~/.iobroker
+	echo "$NPM_COMMAND_FIX" > "$NPM_COMMAND_FIX_PATH"
+	# Activate the change
+	source "$NPM_COMMAND_FIX_PATH"
+
+	# Make sure the bashrc file exists - it should, but you never know...
+	touch ~/.bashrc
+	# If .bashrc does not contain the source command, we need to add it
+	sudo grep -q -E "^source ~/\.iobroker/npm_command_fix" ~/.bashrc &> /dev/null
+	if [ $? -ne 0 ]; then
+		echo "$BASHRC_LINES" >> ~/.bashrc
+	fi
+}
+
+# Changes the root's npm command so it is always executed as `iobroker`
+# when inside the iobroker directory
+change_npm_command_root() {
+	NPM_COMMAND_FIX_PATH=/root/.iobroker/npm_command_fix
+	NPM_COMMAND_FIX=$(cat <<- EOF
+		# While inside the iobroker directory, execute npm as iobroker
+		function npm() {
+			__real_npm=\$(which npm)
+			if [[ $(pwd) == "$IOB_DIR"* ]]; then
+				sudo -H -u $IOB_USER \$__real_npm \$*
+			else
+				eval \$__real_npm \$*
+			fi
+		}
+		EOF
+	)
+	BASHRC_LINES=$(cat <<- EOF
+
+		# Forces npm to run as $IOB_USER when inside the iobroker installation dir
+		source /root/.iobroker/npm_command_fix
+		EOF
+	)
+
+	sudo mkdir -p /root/.iobroker
+	echo "$NPM_COMMAND_FIX" | sudo tee "$NPM_COMMAND_FIX_PATH" &> /dev/null
+	# Activate the change
+	if [ "$IS_ROOT" = "true" ]; then
+		source "$NPM_COMMAND_FIX_PATH"
+	fi
+
+	# Make sure the bashrc file exists - it should, but you never know...
+	sudo touch /root/.bashrc
+	# If .bashrc does not contain the source command, we need to add it
+	sudo grep -q -E "^source /root/\.iobroker/npm_command_fix" /root/.bashrc &> /dev/null
+	if [ $? -ne 0 ]; then
+		echo "$BASHRC_LINES" | sudo tee -a /root/.bashrc &> /dev/null
+	fi
 }
 
 # Enable colored output
@@ -117,7 +242,6 @@ print_bold() {
 	echo "${bold}${HLINE}${normal}"
 	echo
 }
-
 
 print_msg() {
 	text="$1"
@@ -192,13 +316,15 @@ create_user_linux() {
 		"shutdown -h now" "halt" "poweroff" "reboot"
 		"systemctl start" "systemctl stop"
 		"mount" "umount" "systemd-run"
-		"apt-get" "apt" "dpkg" "make"
+		"$INSTALL_CMD" "apt" "dpkg" "make"
 		"ping" "fping"
 		"arp-scan"
 		"setcap"
 		"vcgencmd"
 		"cat"
 		"df"
+		"mysqldump"
+		"ldconfig"
 	)
 
 	SUDOERS_CONTENT="$username ALL=(ALL) ALL\n"
@@ -320,13 +446,29 @@ install_package_linux() {
 	# Test if the package is installed
 	dpkg -s "$package" &> /dev/null
 	if [ $? -ne 0 ]; then
-		# Install it
-		if [ "$IS_ROOT" = true ]; then
-			apt-get install -yq --no-install-recommends $package > /dev/null
+		if [ "$INSTALL_CMD" = "yum" ]; then
+			# Install it
+			if [ "$IS_ROOT" = true ]; then
+				errormessage=$( yum install -q -y $package > /dev/null 2>&1)
+			else
+				errormessage=$( sudo yum install -q -y $package > /dev/null 2>&1)
+			fi
 		else
-			sudo apt-get install -yq --no-install-recommends $package > /dev/null
+			# Install it
+			if [ "$IS_ROOT" = true ]; then
+				errormessage=$( $INSTALL_CMD install -yq --no-install-recommends $package > /dev/null 2>&1)
+			else
+				errormessage=$( sudo $INSTALL_CMD install -yq --no-install-recommends $package > /dev/null 2>&1)
+			fi
 		fi
-		echo "Installed $package"
+
+		# Hide "Error: Nothing to do"
+		if [ "$errormessage" != "Error: Nothing to do" ]; then
+			if [ "$errormessage" != "" ]; then
+				echo $errormessage
+			fi
+			echo "Installed $package"
+		fi
 	fi
 }
 
@@ -359,6 +501,23 @@ install_package_macos() {
 	fi
 }
 
+install_package() {
+	case "$HOST_PLATFORM" in
+		"linux")
+			install_package_linux $1
+		;;
+		"osx")
+			install_package_macos $1
+		;;
+		"freebsd")
+			install_package_freebsd $1
+		;;
+		# The following should never happen, but better be safe than sorry
+		*)
+			echo "Unsupported platform $HOST_PLATFORM"
+		;;
+	esac
+}
 
 fix_dir_permissions() {
 	# Give the user access to all necessary directories
@@ -390,12 +549,40 @@ fix_dir_permissions() {
 	fi
 }
 
-print_bold "Welcome to the ioBroker installation fixer!" "Script version: $FIXER_VERSION" "" "You might need to enter your password a couple of times."
+disable_npm_audit() {
+	# Make sure the npmrc file exists
+	touch .npmrc
+	# If .npmrc does not contain "audit=false", we need to change it
+	grep -q -E "^audit=false" .npmrc &> /dev/null
+	if [ $? -ne 0 ]; then
+		# Remember its contents (minus any possible audit=true)
+		NPMRC_FILE=$(grep -v -E "^audit=true" .npmrc)
+		# And write it back
+		echo "$NPMRC_FILE" > .npmrc
+		# Append the line to disable audit
+		echo "# disable npm audit warnings" >> .npmrc
+		echo "audit=false" >> .npmrc
+	fi
+}
+
+if [ "$IS_ROOT" = true ]; then
+	print_bold "Welcome to the ioBroker installation fixer!" "Script version: $FIXER_VERSION"
+else
+	print_bold "Welcome to the ioBroker installation fixer!" "Script version: $FIXER_VERSION" "" "You might need to enter your password a couple of times."
+fi
 
 NUM_STEPS=3
 
 # ########################################################
 print_step "Installing prerequisites" 1 "$NUM_STEPS"
+
+# update repos
+if [ "$IS_ROOT" = true ]; then
+	$INSTALL_CMD update -y
+else
+	sudo $INSTALL_CMD update -y
+fi
+
 # Determine the platform we operate on and select the installation routine/packages accordingly 
 case "$HOST_PLATFORM" in
 	"linux")
@@ -515,6 +702,16 @@ if [ "$HOST_PLATFORM" != "osx" ]; then
 	fix_dir_permissions
 fi
 
+# Force npm to run as iobroker when inside IOB_DIR
+if [[ "$IS_ROOT" != true && "$USER" != "$IOB_USER" ]]; then
+	change_npm_command_user
+fi
+change_npm_command_root
+
+# Disable any warnings related to "npm audit fix"
+cd $IOB_DIR
+disable_npm_audit
+
 # ########################################################
 print_step "Checking autostart" 3 "$NUM_STEPS"
 
@@ -586,7 +783,6 @@ echo "init system: $INITSYSTEM" >> $INSTALLER_INFO_FILE
 # Create "iob" and "iobroker" executables
 # If possible, try to always execute the iobroker CLI as the correct user
 IOB_NODE_CMDLINE="node"
-BASH_CMDLINE=$(which bash)
 if [ "$IOB_USER" != "$USER" ]; then
 	IOB_NODE_CMDLINE="sudo -H -u $IOB_USER node"
 fi

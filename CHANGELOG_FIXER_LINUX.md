@@ -1,7 +1,23 @@
 # Changelog for Linux-Fixer-Script
 
+## 2019-10-13
+* Always run `npm` as iobroker when inside installation dir
+
+## 2019-09-30
+* Allow passwordless sudo for `mysqldump`
+* Allow passwordless sudo for `ldconfig`
+
+## 2019-09-25
+* Disable any warnings related to `npm audit fix`
+
+## 2019-09-16
+* Support of CentOS and AWS AMI
+
 ## 2019-07-21
-* suppress warnings
+* suppress warnings during npm install
+
+## 2019-07-17
+* Fix for Debian 10: Add `/sbin` and similar directories to `PATH` at the start of the script
 
 ## 2019-07-03
 * Include `PATH` environment variable in OSX startup script
